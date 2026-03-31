@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              text-expansion-global
 // @name            Text Expansion
-// @description     Uses a system-wide low-level hook to replace typed hotstrings anywhere. Supports multi-line blocks and variables.
-// @version         0.5
+// @description     System-wide text expansion with activation symbols and an extensible settings UI.
+// @version         0.6
 // @author          Wouter
 // @include         explorer.exe
 // @compilerOptions -luser32
@@ -10,20 +10,31 @@
 
 // ==WindhawkModSettings==
 /*
-- hotstrings: |
-    [btw]
-    by the way
-
-    [sql]
-    SELECT *
-    FROM Users
-    WHERE Id = 1;
-
-    [now]
-    Current Date: %DATE%
-    Current Time: %TIME%
-  $name: Hotstrings Configuration
-  $description: Define hotstrings here. Put the trigger in brackets. Supported variables: %DATE%, %TIME%.
+- activation_symbol:
+  - $name: Activation Symbol
+  - $description: The prefix symbol required to trigger an expansion (e.g., / or !).
+  - $default: "/"
+- instant_expansion:
+  - $name: Instant Expansion
+  - $description: If enabled, ignore the activation symbol and expand immediately upon typing the hotstring.
+  - $type: bool
+  - $default: false
+- expansions:
+  - $name: Hotstring Mappings
+  - $description: Add your hotstrings and replacements here. Use \n in the replacement text for line breaks.
+  - $default:
+    - trigger: btw
+      replacement: by the way
+    - trigger: sql
+      replacement: "SELECT *\nFROM Users\nWHERE Id = 1;"
+    - trigger: now
+      replacement: "Current Date: %DATE%\nCurrent Time: %TIME%"
+  - trigger:
+    - $name: Hotstring Trigger
+    - $description: What you type (do not include the activation symbol here)
+  - replacement:
+    - $name: Replacement Text
+    - $description: The text to insert (use \n for multiline)
 */
 // ==/WindhawkModSettings==
 
@@ -31,7 +42,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <sstream>
 
 HHOOK g_hHook = NULL;
 HANDLE g_hThread = NULL;
@@ -42,6 +52,9 @@ std::wstring g_buffer;
 size_t g_maxHotstringLength = 0;
 bool g_isProcessing = false;
 SRWLOCK g_lock = SRWLOCK_INIT;
+
+bool g_instantExpansion = false;
+std::wstring g_activationSymbol = L"/";
 
 void ReplaceAll(std::wstring& str, const std::wstring& from, const std::wstring& to) {
     if (from.empty()) return;
@@ -79,53 +92,51 @@ std::wstring ProcessVariables(std::wstring text) {
     return text;
 }
 
+// Dynamically iterates through the Windhawk settings array
 void LoadSettings() {
-    PCWSTR settingsStr = Wh_GetStringSetting(L"hotstrings");
-    if (settingsStr) {
-        std::wstring s(settingsStr);
-        Wh_FreeStringSetting(settingsStr);
-        
-        AcquireSRWLockExclusive(&g_lock);
-        g_expansions.clear();
-        g_maxHotstringLength = 0;
-        
-        std::wstringstream ss(s);
-        std::wstring line;
-        std::wstring currentTrigger = L"";
-        std::wstring currentReplacement = L"";
-        
-        while (std::getline(ss, line)) {
-            if (!line.empty() && line.back() == L'\r') line.pop_back();
-            
-            if (line.length() >= 2 && line.front() == L'[' && line.back() == L']') {
-                if (!currentTrigger.empty()) {
-                    if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
-                        currentReplacement.pop_back();
-                    }
-                    g_expansions[currentTrigger] = currentReplacement;
-                    if (currentTrigger.length() > g_maxHotstringLength) {
-                        g_maxHotstringLength = currentTrigger.length();
-                    }
-                }
-                currentTrigger = line.substr(1, line.length() - 2);
-                currentReplacement = L"";
-            } else if (!currentTrigger.empty()) {
-                currentReplacement += line + L"\n";
-            }
-        }
-        
-        if (!currentTrigger.empty()) {
-            if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
-                currentReplacement.pop_back();
-            }
-            g_expansions[currentTrigger] = currentReplacement;
-            if (currentTrigger.length() > g_maxHotstringLength) {
-                g_maxHotstringLength = currentTrigger.length();
-            }
-        }
-        
-        ReleaseSRWLockExclusive(&g_lock);
+    AcquireSRWLockExclusive(&g_lock);
+    g_expansions.clear();
+    g_maxHotstringLength = 0;
+    
+    g_instantExpansion = Wh_GetIntSetting(L"instant_expansion");
+    
+    PCWSTR symStr = Wh_GetStringSetting(L"activation_symbol");
+    if (symStr) {
+        g_activationSymbol = symStr;
+        Wh_FreeStringSetting(symStr);
     }
+
+    for (int i = 0; ; i++) {
+        std::wstring triggerKey = L"expansions[" + std::to_wstring(i) + L"].trigger";
+        std::wstring replKey = L"expansions[" + std::to_wstring(i) + L"].replacement";
+        
+        PCWSTR trigger = Wh_GetStringSetting(triggerKey.c_str());
+        if (!trigger) break; // End of the array
+        
+        PCWSTR repl = Wh_GetStringSetting(replKey.c_str());
+        if (repl) {
+            std::wstring t(trigger);
+            std::wstring r(repl);
+            
+            // Translate literal "\n" strings from the UI into real newlines
+            ReplaceAll(r, L"\\n", L"\n");
+            
+            if (!g_instantExpansion) {
+                t = g_activationSymbol + t;
+            }
+            
+            if (!t.empty()) {
+                g_expansions[t] = r;
+                if (t.length() > g_maxHotstringLength) {
+                    g_maxHotstringLength = t.length();
+                }
+            }
+            Wh_FreeStringSetting(repl);
+        }
+        Wh_FreeStringSetting(trigger);
+    }
+    
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 void SendBackspace(int count) {
@@ -168,6 +179,31 @@ void SendString(const std::wstring& str) {
     if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
+// Maps standard US layout symbols for the keystroke buffer
+wchar_t GetCharFromVK(DWORD vkCode) {
+    bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+    
+    if (vkCode >= 'A' && vkCode <= 'Z') return (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
+    if (vkCode >= '0' && vkCode <= '9') return shift ? L")!@#$%^&*("[vkCode - '0'] : (wchar_t)vkCode;
+    
+    switch(vkCode) {
+        case VK_SPACE:     return L' ';
+        case VK_OEM_MINUS: return shift ? L'_' : L'-';
+        case VK_OEM_PLUS:  return shift ? L'+' : L'=';
+        case VK_OEM_1:     return shift ? L':' : L';';
+        case VK_OEM_2:     return shift ? L'?' : L'/';
+        case VK_OEM_3:     return shift ? L'~' : L'`';
+        case VK_OEM_4:     return shift ? L'{' : L'[';
+        case VK_OEM_5:     return shift ? L'|' : L'\\';
+        case VK_OEM_6:     return shift ? L'}' : L']';
+        case VK_OEM_7:     return shift ? L'"' : L'\'';
+        case VK_OEM_COMMA: return shift ? L'<' : L',';
+        case VK_OEM_PERIOD:return shift ? L'>' : L'.';
+    }
+    return 0;
+}
+
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
         if (g_isProcessing) return CallNextHookEx(g_hHook, nCode, wParam, lParam);
@@ -175,23 +211,12 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         KBDLLHOOKSTRUCT* pKeyBoard = (KBDLLHOOKSTRUCT*)lParam;
         DWORD vkCode = pKeyBoard->vkCode;
         
-        wchar_t c = 0;
-        
-        if (vkCode >= 'A' && vkCode <= 'Z') {
-            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
-            c = (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
-        } 
-        else if (vkCode >= '0' && vkCode <= '9') c = (wchar_t)vkCode;
-        else if (vkCode == VK_SPACE) c = L' ';
-        else if (vkCode == VK_BACK) {
+        if (vkCode == VK_BACK) {
             if (!g_buffer.empty()) g_buffer.pop_back();
             return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-        } 
-        else if (vkCode != VK_SHIFT && vkCode != VK_CAPITAL && vkCode != VK_LWIN && vkCode != VK_RWIN) {
-            g_buffer.clear(); 
-            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
         }
+        
+        wchar_t c = GetCharFromVK(vkCode);
         
         if (c != 0) {
             g_buffer += c;
@@ -219,6 +244,9 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 }
             }
             ReleaseSRWLockShared(&g_lock);
+        } else if (vkCode != VK_SHIFT && vkCode != VK_CAPITAL && vkCode != VK_LWIN && vkCode != VK_RWIN && vkCode != VK_CONTROL && vkCode != VK_MENU) {
+            // Unmapped control keys (like Arrow keys, Escape, Enter) clear the buffer so triggers don't wrap across lines
+            g_buffer.clear(); 
         }
     }
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
