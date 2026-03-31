@@ -1,10 +1,10 @@
 // ==WindhawkMod==
-// @id              text-expansion-everywhere
-// @name            Text Expansion (Per-Process)
-// @description     Injects into all processes locally to replace typed hotstrings. Supports multi-line blocks and variables.
-// @version         0.4
+// @id              text-expansion-global
+// @name            Text Expansion
+// @description     Uses a system-wide low-level hook to replace typed hotstrings anywhere. Supports multi-line blocks and variables.
+// @version         0.5
 // @author          Wouter
-// @include         *
+// @include         explorer.exe
 // @compilerOptions -luser32
 // ==/WindhawkMod==
 
@@ -33,14 +33,16 @@
 #include <vector>
 #include <sstream>
 
+HHOOK g_hHook = NULL;
+HANDLE g_hThread = NULL;
+DWORD g_threadId = 0;
+
 std::unordered_map<std::wstring, std::wstring> g_expansions;
+std::wstring g_buffer;
 size_t g_maxHotstringLength = 0;
+bool g_isProcessing = false;
 SRWLOCK g_lock = SRWLOCK_INIT;
 
-thread_local std::wstring t_buffer;
-thread_local bool t_isProcessing = false;
-
-// Helper function to replace all occurrences of a substring
 void ReplaceAll(std::wstring& str, const std::wstring& from, const std::wstring& to) {
     if (from.empty()) return;
     size_t start_pos = 0;
@@ -50,7 +52,6 @@ void ReplaceAll(std::wstring& str, const std::wstring& from, const std::wstring&
     }
 }
 
-// Fetches the current system date
 std::wstring GetCurrentDateStr() {
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -59,16 +60,15 @@ std::wstring GetCurrentDateStr() {
     return std::wstring(buffer);
 }
 
-// Fetches the current system time in 24-hour format
 std::wstring GetCurrentTimeStr() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t buffer[256];
+    // Formatted to 24-hour notation
     GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, L"HH:mm", buffer, 256);
     return std::wstring(buffer);
 }
 
-// Scans the replacement text and injects live variables
 std::wstring ProcessVariables(std::wstring text) {
     if (text.find(L"%DATE%") != std::wstring::npos) {
         ReplaceAll(text, L"%DATE%", GetCurrentDateStr());
@@ -79,7 +79,6 @@ std::wstring ProcessVariables(std::wstring text) {
     return text;
 }
 
-// Parses the INI-style block configuration
 void LoadSettings() {
     PCWSTR settingsStr = Wh_GetStringSetting(L"hotstrings");
     if (settingsStr) {
@@ -96,9 +95,7 @@ void LoadSettings() {
         std::wstring currentReplacement = L"";
         
         while (std::getline(ss, line)) {
-            if (!line.empty() && line.back() == L'\r') {
-                line.pop_back();
-            }
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
             
             if (line.length() >= 2 && line.front() == L'[' && line.back() == L']') {
                 if (!currentTrigger.empty()) {
@@ -154,7 +151,6 @@ void SendString(const std::wstring& str) {
             ip.type = INPUT_KEYBOARD;
             ip.ki.wVk = VK_RETURN;
             inputs.push_back(ip);
-            
             ip.ki.dwFlags = KEYEVENTF_KEYUP;
             inputs.push_back(ip);
             continue;
@@ -172,87 +168,74 @@ void SendString(const std::wstring& str) {
     if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
-bool ProcessKey(DWORD vkCode) {
-    if (t_isProcessing) return false;
-    
-    wchar_t c = 0;
-    if (vkCode >= 'A' && vkCode <= 'Z') {
-        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
-        c = (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
-    } else if (vkCode >= '0' && vkCode <= '9') {
-        c = (wchar_t)vkCode;
-    } else if (vkCode == VK_SPACE) {
-        c = L' ';
-    } else if (vkCode == VK_BACK) {
-        if (!t_buffer.empty()) t_buffer.pop_back();
-        return false;
-    } else if (vkCode != VK_SHIFT && vkCode != VK_CAPITAL) {
-        t_buffer.clear();
-        return false;
-    }
-    
-    if (c != 0) {
-        t_buffer += c;
+LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        if (g_isProcessing) return CallNextHookEx(g_hHook, nCode, wParam, lParam);
         
-        AcquireSRWLockShared(&g_lock);
-        if (t_buffer.length() > g_maxHotstringLength) {
-            t_buffer.erase(0, t_buffer.length() - g_maxHotstringLength);
+        KBDLLHOOKSTRUCT* pKeyBoard = (KBDLLHOOKSTRUCT*)lParam;
+        DWORD vkCode = pKeyBoard->vkCode;
+        
+        wchar_t c = 0;
+        
+        if (vkCode >= 'A' && vkCode <= 'Z') {
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+            c = (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
+        } 
+        else if (vkCode >= '0' && vkCode <= '9') c = (wchar_t)vkCode;
+        else if (vkCode == VK_SPACE) c = L' ';
+        else if (vkCode == VK_BACK) {
+            if (!g_buffer.empty()) g_buffer.pop_back();
+            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+        } 
+        else if (vkCode != VK_SHIFT && vkCode != VK_CAPITAL && vkCode != VK_LWIN && vkCode != VK_RWIN) {
+            g_buffer.clear(); 
+            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
         }
         
-        for (const auto& pair : g_expansions) {
-            const std::wstring& trigger = pair.first;
-            if (t_buffer.length() >= trigger.length() && 
-                t_buffer.compare(t_buffer.length() - trigger.length(), trigger.length(), trigger) == 0) {
-                
-                t_isProcessing = true;
-                t_buffer.clear();
-                
-                // Block the current key, erase the typed hotstring, then send the processed text
-                SendBackspace((int)trigger.length() - 1);
-                
-                std::wstring finalOutput = ProcessVariables(pair.second);
-                SendString(finalOutput);
-                
-                t_isProcessing = false;
-                ReleaseSRWLockShared(&g_lock);
-                return true; 
+        if (c != 0) {
+            g_buffer += c;
+            
+            AcquireSRWLockShared(&g_lock);
+            if (g_buffer.length() > g_maxHotstringLength) {
+                g_buffer.erase(0, g_buffer.length() - g_maxHotstringLength);
             }
+            
+            for (const auto& pair : g_expansions) {
+                const std::wstring& trigger = pair.first;
+                if (g_buffer.length() >= trigger.length() && 
+                    g_buffer.compare(g_buffer.length() - trigger.length(), trigger.length(), trigger) == 0) {
+                    
+                    g_isProcessing = true;
+                    g_buffer.clear();
+                    
+                    SendBackspace((int)trigger.length() - 1);
+                    std::wstring finalOutput = ProcessVariables(pair.second);
+                    SendString(finalOutput);
+                    
+                    g_isProcessing = false;
+                    ReleaseSRWLockShared(&g_lock);
+                    return 1; 
+                }
+            }
+            ReleaseSRWLockShared(&g_lock);
         }
-        ReleaseSRWLockShared(&g_lock);
     }
-    return false;
+    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 }
 
-// Hooks
-typedef BOOL (WINAPI *GetMessageW_t)(LPMSG, HWND, UINT, UINT);
-GetMessageW_t GetMessageW_Original;
-
-BOOL WINAPI GetMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL res = GetMessageW_Original(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res > 0 && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (ProcessKey((DWORD)lpMsg->wParam)) {
-                lpMsg->message = WM_NULL; 
-            }
-        }
+DWORD WINAPI HookThread(LPVOID lpParam) {
+    g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
-    return res;
-}
-
-typedef BOOL (WINAPI *PeekMessageW_t)(LPMSG, HWND, UINT, UINT, UINT);
-PeekMessageW_t PeekMessageW_Original;
-
-BOOL WINAPI PeekMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL res = PeekMessageW_Original(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && lpMsg && (wRemoveMsg & PM_REMOVE)) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (ProcessKey((DWORD)lpMsg->wParam)) {
-                lpMsg->message = WM_NULL;
-            }
-        }
+    if (g_hHook) {
+        UnhookWindowsHookEx(g_hHook);
+        g_hHook = NULL;
     }
-    return res;
+    return 0;
 }
 
 void Wh_ModSettingsChanged() {
@@ -261,9 +244,14 @@ void Wh_ModSettingsChanged() {
 
 BOOL Wh_ModInit() {
     LoadSettings();
-    Wh_SetFunctionHook((void*)GetMessageW, (void*)GetMessageW_Hook, (void**)&GetMessageW_Original);
-    Wh_SetFunctionHook((void*)PeekMessageW, (void*)PeekMessageW_Hook, (void**)&PeekMessageW_Original);
+    g_hThread = CreateThread(NULL, 0, HookThread, NULL, 0, &g_threadId);
     return TRUE;
 }
 
-void Wh_ModUninit() {}
+void Wh_ModUninit() {
+    if (g_threadId) {
+        PostThreadMessage(g_threadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_hThread, 1000);
+        CloseHandle(g_hThread);
+    }
+}
