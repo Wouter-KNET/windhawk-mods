@@ -2,17 +2,28 @@
 // @id              text-expansion-everywhere
 // @name            Text Expansion (Per-Process)
 // @description     Injects into all processes locally to replace typed hotstrings. Supports multi-line blocks.
-// @version         0.2
+// @version         0.3
 // @author          Wouter
 // @include         *
 // @compilerOptions -luser32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
-// - hotstrings:
-//   - $name: Hotstrings Configuration
-//   - $description: Define hotstrings here. Put the trigger in brackets (e.g., [btw]), followed by the replacement text on the next lines.
-//   - $default: "[btw]\nby the way\n\n[brb]\nbe right back\n\n[sql]\nSELECT *\nFROM Users\nWHERE Id = 1;"
+/*
+- hotstrings: |
+    [btw]
+    by the way
+
+    [brb]
+    be right back
+
+    [sql]
+    SELECT *
+    FROM Users
+    WHERE Id = 1;
+  $name: Hotstrings Configuration
+  $description: Define hotstrings here. Put the trigger in brackets (e.g., [btw]), followed by the replacement text on the next lines.
+*/
 // ==/WindhawkModSettings==
 
 #include <windows.h>
@@ -101,9 +112,9 @@ void SendBackspace(int count) {
 void SendString(const std::wstring& str) {
     std::vector<INPUT> inputs;
     for (wchar_t c : str) {
-        if (c == L'\r') continue; // Ignore standalone carriage returns
+        if (c == L'\r') continue; 
         
-        // Translate \n to an actual Enter key press
+        // Translate \n to an actual Enter key press to maintain formatting
         if (c == L'\n') {
             INPUT ip = {0};
             ip.type = INPUT_KEYBOARD;
@@ -115,7 +126,6 @@ void SendString(const std::wstring& str) {
             continue;
         }
         
-        // Standard Unicode text injection
         INPUT ip = {0};
         ip.type = INPUT_KEYBOARD;
         ip.ki.wScan = c;
@@ -177,7 +187,7 @@ bool ProcessKey(DWORD vkCode) {
     return false;
 }
 
-// Intercepts messages directly inside the UI loop of the target process
+// Hooks
 typedef BOOL (WINAPI *GetMessageW_t)(LPMSG, HWND, UINT, UINT);
 GetMessageW_t GetMessageW_Original;
 
@@ -219,6 +229,4 @@ BOOL Wh_ModInit() {
     return TRUE;
 }
 
-void Wh_ModUninit() {
-    // Unhooking handled implicitly by Windhawk
-}
+void Wh_ModUninit() {}
