@@ -2,40 +2,30 @@
 // @id              text-expansion-global
 // @name            Text Expansion
 // @description     System-wide text expansion with activation symbols and an extensible settings UI.
-// @version         0.6
+// @version         0.7
 // @author          Wouter
 // @include         explorer.exe
 // @compilerOptions -luser32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
-/*
-- activation_symbol:
-  - $name: Activation Symbol
-  - $description: The prefix symbol required to trigger an expansion (e.g., / or !).
-  - $default: "/"
-- instant_expansion:
-  - $name: Instant Expansion
-  - $description: If enabled, ignore the activation symbol and expand immediately upon typing the hotstring.
-  - $type: bool
-  - $default: false
-- expansions:
-  - $name: Hotstring Mappings
-  - $description: Add your hotstrings and replacements here. Use \n in the replacement text for line breaks.
-  - $default:
-    - trigger: btw
-      replacement: by the way
-    - trigger: sql
-      replacement: "SELECT *\nFROM Users\nWHERE Id = 1;"
-    - trigger: now
-      replacement: "Current Date: %DATE%\nCurrent Time: %TIME%"
-  - trigger:
-    - $name: Hotstring Trigger
-    - $description: What you type (do not include the activation symbol here)
-  - replacement:
-    - $name: Replacement Text
-    - $description: The text to insert (use \n for multiline)
-*/
+// - activation_symbol:
+//   - $name: Activation Symbol
+//   - $description: The prefix symbol required to trigger an expansion (e.g. / or !).
+//   - $default: /
+// - instant_expansion:
+//   - $name: Instant Expansion
+//   - $description: If true, ignore the activation symbol and expand immediately upon typing the hotstring.
+//   - $default: false
+// - expansions:
+//   - $name: Hotstring Mappings
+//   - $description: Add your hotstrings here. Use \n for line breaks, %DATE% for current date, %TIME% for current time.
+//   - trigger:
+//     - $name: Hotstring Trigger
+//     - $description: What you type (do not include the activation symbol here)
+//   - replacement:
+//     - $name: Replacement Text
+//     - $description: The text to insert (use \n for multiline)
 // ==/WindhawkModSettings==
 
 #include <windows.h>
@@ -77,7 +67,7 @@ std::wstring GetCurrentTimeStr() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t buffer[256];
-    // Formatted to 24-hour notation
+    // Formatted to 24-hour notation per your preference
     GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, L"HH:mm", buffer, 256);
     return std::wstring(buffer);
 }
@@ -98,7 +88,8 @@ void LoadSettings() {
     g_expansions.clear();
     g_maxHotstringLength = 0;
     
-    g_instantExpansion = Wh_GetIntSetting(L"instant_expansion");
+    // Windhawk natively casts boolean UI checkboxes to integers
+    g_instantExpansion = Wh_GetIntSetting(L"instant_expansion") != 0;
     
     PCWSTR symStr = Wh_GetStringSetting(L"activation_symbol");
     if (symStr) {
