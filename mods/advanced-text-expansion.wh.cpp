@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              text-expansion-everywhere
 // @name            Text Expansion (Per-Process)
-// @description     Injects into all processes locally to replace typed hotstrings. Supports multi-line blocks.
-// @version         0.3
+// @description     Injects into all processes locally to replace typed hotstrings. Supports multi-line blocks and variables.
+// @version         0.4
 // @author          Wouter
 // @include         *
 // @compilerOptions -luser32
@@ -14,15 +14,16 @@
     [btw]
     by the way
 
-    [brb]
-    be right back
-
     [sql]
     SELECT *
     FROM Users
     WHERE Id = 1;
+
+    [now]
+    Current Date: %DATE%
+    Current Time: %TIME%
   $name: Hotstrings Configuration
-  $description: Define hotstrings here. Put the trigger in brackets (e.g., [btw]), followed by the replacement text on the next lines.
+  $description: Define hotstrings here. Put the trigger in brackets. Supported variables: %DATE%, %TIME%.
 */
 // ==/WindhawkModSettings==
 
@@ -38,6 +39,45 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 
 thread_local std::wstring t_buffer;
 thread_local bool t_isProcessing = false;
+
+// Helper function to replace all occurrences of a substring
+void ReplaceAll(std::wstring& str, const std::wstring& from, const std::wstring& to) {
+    if (from.empty()) return;
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::wstring::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); 
+    }
+}
+
+// Fetches the current system date
+std::wstring GetCurrentDateStr() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buffer[256];
+    GetDateFormatW(LOCALE_USER_DEFAULT, 0, &st, L"yyyy-MM-dd", buffer, 256);
+    return std::wstring(buffer);
+}
+
+// Fetches the current system time in 24-hour format
+std::wstring GetCurrentTimeStr() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buffer[256];
+    GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &st, L"HH:mm", buffer, 256);
+    return std::wstring(buffer);
+}
+
+// Scans the replacement text and injects live variables
+std::wstring ProcessVariables(std::wstring text) {
+    if (text.find(L"%DATE%") != std::wstring::npos) {
+        ReplaceAll(text, L"%DATE%", GetCurrentDateStr());
+    }
+    if (text.find(L"%TIME%") != std::wstring::npos) {
+        ReplaceAll(text, L"%TIME%", GetCurrentTimeStr());
+    }
+    return text;
+}
 
 // Parses the INI-style block configuration
 void LoadSettings() {
@@ -56,15 +96,12 @@ void LoadSettings() {
         std::wstring currentReplacement = L"";
         
         while (std::getline(ss, line)) {
-            // Normalize CRLF to LF
             if (!line.empty() && line.back() == L'\r') {
                 line.pop_back();
             }
             
-            // Check if the line denotes a new [trigger]
             if (line.length() >= 2 && line.front() == L'[' && line.back() == L']') {
                 if (!currentTrigger.empty()) {
-                    // Strip the trailing newline from the accumulated replacement block
                     if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
                         currentReplacement.pop_back();
                     }
@@ -76,12 +113,10 @@ void LoadSettings() {
                 currentTrigger = line.substr(1, line.length() - 2);
                 currentReplacement = L"";
             } else if (!currentTrigger.empty()) {
-                // Append multi-line content
                 currentReplacement += line + L"\n";
             }
         }
         
-        // Save the final trigger block
         if (!currentTrigger.empty()) {
             if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
                 currentReplacement.pop_back();
@@ -114,7 +149,6 @@ void SendString(const std::wstring& str) {
     for (wchar_t c : str) {
         if (c == L'\r') continue; 
         
-        // Translate \n to an actual Enter key press to maintain formatting
         if (c == L'\n') {
             INPUT ip = {0};
             ip.type = INPUT_KEYBOARD;
@@ -174,8 +208,11 @@ bool ProcessKey(DWORD vkCode) {
                 t_isProcessing = true;
                 t_buffer.clear();
                 
+                // Block the current key, erase the typed hotstring, then send the processed text
                 SendBackspace((int)trigger.length() - 1);
-                SendString(pair.second);
+                
+                std::wstring finalOutput = ProcessVariables(pair.second);
+                SendString(finalOutput);
                 
                 t_isProcessing = false;
                 ReleaseSRWLockShared(&g_lock);
