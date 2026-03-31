@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              text-expansion-everywhere
 // @name            Text Expansion (Per-Process)
-// @description     Injects into all processes locally to replace typed hotstrings
-// @version         0.1
+// @description     Injects into all processes locally to replace typed hotstrings. Supports multi-line blocks.
+// @version         0.2
 // @author          Wouter
 // @include         *
 // @compilerOptions -luser32
@@ -11,8 +11,8 @@
 // ==WindhawkModSettings==
 // - hotstrings:
 //   - $name: Hotstrings Configuration
-//   - $description: Format: hotstring=replacement (comma-separated)
-//   - $default: btw=by the way, brb=be right back
+//   - $description: Define hotstrings here. Put the trigger in brackets (e.g., [btw]), followed by the replacement text on the next lines.
+//   - $default: "[btw]\nby the way\n\n[brb]\nbe right back\n\n[sql]\nSELECT *\nFROM Users\nWHERE Id = 1;"
 // ==/WindhawkModSettings==
 
 #include <windows.h>
@@ -25,10 +25,10 @@ std::unordered_map<std::wstring, std::wstring> g_expansions;
 size_t g_maxHotstringLength = 0;
 SRWLOCK g_lock = SRWLOCK_INIT;
 
-// Use thread_local because this DLL runs in all threads of all processes
 thread_local std::wstring t_buffer;
 thread_local bool t_isProcessing = false;
 
+// Parses the INI-style block configuration
 void LoadSettings() {
     PCWSTR settingsStr = Wh_GetStringSetting(L"hotstrings");
     if (settingsStr) {
@@ -40,25 +40,47 @@ void LoadSettings() {
         g_maxHotstringLength = 0;
         
         std::wstringstream ss(s);
-        std::wstring item;
+        std::wstring line;
+        std::wstring currentTrigger = L"";
+        std::wstring currentReplacement = L"";
         
-        while (std::getline(ss, item, L',')) {
-            size_t start = item.find_first_not_of(L" \t");
-            if (start != std::wstring::npos) item = item.substr(start);
-
-            size_t eqPos = item.find(L'=');
-            if (eqPos != std::wstring::npos) {
-                std::wstring trigger = item.substr(0, eqPos);
-                std::wstring replacement = item.substr(eqPos + 1);
-                
-                if (!trigger.empty()) {
-                    g_expansions[trigger] = replacement;
-                    if (trigger.length() > g_maxHotstringLength) {
-                        g_maxHotstringLength = trigger.length();
+        while (std::getline(ss, line)) {
+            // Normalize CRLF to LF
+            if (!line.empty() && line.back() == L'\r') {
+                line.pop_back();
+            }
+            
+            // Check if the line denotes a new [trigger]
+            if (line.length() >= 2 && line.front() == L'[' && line.back() == L']') {
+                if (!currentTrigger.empty()) {
+                    // Strip the trailing newline from the accumulated replacement block
+                    if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
+                        currentReplacement.pop_back();
+                    }
+                    g_expansions[currentTrigger] = currentReplacement;
+                    if (currentTrigger.length() > g_maxHotstringLength) {
+                        g_maxHotstringLength = currentTrigger.length();
                     }
                 }
+                currentTrigger = line.substr(1, line.length() - 2);
+                currentReplacement = L"";
+            } else if (!currentTrigger.empty()) {
+                // Append multi-line content
+                currentReplacement += line + L"\n";
             }
         }
+        
+        // Save the final trigger block
+        if (!currentTrigger.empty()) {
+            if (!currentReplacement.empty() && currentReplacement.back() == L'\n') {
+                currentReplacement.pop_back();
+            }
+            g_expansions[currentTrigger] = currentReplacement;
+            if (currentTrigger.length() > g_maxHotstringLength) {
+                g_maxHotstringLength = currentTrigger.length();
+            }
+        }
+        
         ReleaseSRWLockExclusive(&g_lock);
     }
 }
@@ -79,11 +101,27 @@ void SendBackspace(int count) {
 void SendString(const std::wstring& str) {
     std::vector<INPUT> inputs;
     for (wchar_t c : str) {
+        if (c == L'\r') continue; // Ignore standalone carriage returns
+        
+        // Translate \n to an actual Enter key press
+        if (c == L'\n') {
+            INPUT ip = {0};
+            ip.type = INPUT_KEYBOARD;
+            ip.ki.wVk = VK_RETURN;
+            inputs.push_back(ip);
+            
+            ip.ki.dwFlags = KEYEVENTF_KEYUP;
+            inputs.push_back(ip);
+            continue;
+        }
+        
+        // Standard Unicode text injection
         INPUT ip = {0};
         ip.type = INPUT_KEYBOARD;
         ip.ki.wScan = c;
         ip.ki.dwFlags = KEYEVENTF_UNICODE;
         inputs.push_back(ip);
+        
         ip.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         inputs.push_back(ip);
     }
@@ -131,7 +169,7 @@ bool ProcessKey(DWORD vkCode) {
                 
                 t_isProcessing = false;
                 ReleaseSRWLockShared(&g_lock);
-                return true; // Match found, swallow the final trigger key
+                return true; 
             }
         }
         ReleaseSRWLockShared(&g_lock);
@@ -139,7 +177,7 @@ bool ProcessKey(DWORD vkCode) {
     return false;
 }
 
-// Hook GetMessageW
+// Intercepts messages directly inside the UI loop of the target process
 typedef BOOL (WINAPI *GetMessageW_t)(LPMSG, HWND, UINT, UINT);
 GetMessageW_t GetMessageW_Original;
 
@@ -148,14 +186,13 @@ BOOL WINAPI GetMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wM
     if (res > 0 && lpMsg) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (ProcessKey((DWORD)lpMsg->wParam)) {
-                lpMsg->message = WM_NULL; // Swallow the triggering keystroke
+                lpMsg->message = WM_NULL; 
             }
         }
     }
     return res;
 }
 
-// Hook PeekMessageW
 typedef BOOL (WINAPI *PeekMessageW_t)(LPMSG, HWND, UINT, UINT, UINT);
 PeekMessageW_t PeekMessageW_Original;
 
@@ -164,7 +201,7 @@ BOOL WINAPI PeekMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT w
     if (res && lpMsg && (wRemoveMsg & PM_REMOVE)) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (ProcessKey((DWORD)lpMsg->wParam)) {
-                lpMsg->message = WM_NULL; // Swallow the triggering keystroke
+                lpMsg->message = WM_NULL;
             }
         }
     }
@@ -183,5 +220,5 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModUninit() {
-    // Windhawk automatically handles API unhooking on unload
+    // Unhooking handled implicitly by Windhawk
 }
