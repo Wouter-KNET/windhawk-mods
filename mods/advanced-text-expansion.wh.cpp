@@ -1,18 +1,18 @@
 // ==WindhawkMod==
-// @id              text-expansion
-// @name            Text Expansion
-// @description     Replaces typed hotstrings with configured replacement texts globally
-// @version         0.0
+// @id              text-expansion-everywhere
+// @name            Text Expansion (Per-Process)
+// @description     Injects into all processes locally to replace typed hotstrings
+// @version         0.1
 // @author          Wouter
-// @include         explorer.exe
+// @include         *
 // @compilerOptions -luser32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
 // - hotstrings:
 //   - $name: Hotstrings Configuration
-//   - $description: Format: hotstring=replacement (comma-separated for multiple. e.g., btw=by the way, brb=be right back)
-//   - $default: btw=by the way, brb=be right back, addr=123 Main Street
+//   - $description: Format: hotstring=replacement (comma-separated)
+//   - $default: btw=by the way, brb=be right back
 // ==/WindhawkModSettings==
 
 #include <windows.h>
@@ -21,30 +21,28 @@
 #include <vector>
 #include <sstream>
 
-HHOOK g_hHook = NULL;
-HANDLE g_hThread = NULL;
-DWORD g_threadId = 0;
-
 std::unordered_map<std::wstring, std::wstring> g_expansions;
-std::wstring g_buffer;
 size_t g_maxHotstringLength = 0;
-bool g_isProcessing = false;
+SRWLOCK g_lock = SRWLOCK_INIT;
 
-// Reloads configuration from the Windhawk UI
+// Use thread_local because this DLL runs in all threads of all processes
+thread_local std::wstring t_buffer;
+thread_local bool t_isProcessing = false;
+
 void LoadSettings() {
     PCWSTR settingsStr = Wh_GetStringSetting(L"hotstrings");
     if (settingsStr) {
-        g_expansions.clear();
-        g_maxHotstringLength = 0;
-        
         std::wstring s(settingsStr);
         Wh_FreeStringSetting(settingsStr);
+        
+        AcquireSRWLockExclusive(&g_lock);
+        g_expansions.clear();
+        g_maxHotstringLength = 0;
         
         std::wstringstream ss(s);
         std::wstring item;
         
         while (std::getline(ss, item, L',')) {
-            // Trim leading whitespace
             size_t start = item.find_first_not_of(L" \t");
             if (start != std::wstring::npos) item = item.substr(start);
 
@@ -61,10 +59,10 @@ void LoadSettings() {
                 }
             }
         }
+        ReleaseSRWLockExclusive(&g_lock);
     }
 }
 
-// Emits VK_BACK to erase the hotstring characters
 void SendBackspace(int count) {
     std::vector<INPUT> inputs;
     for (int i = 0; i < count; ++i) {
@@ -72,16 +70,12 @@ void SendBackspace(int count) {
         ip.type = INPUT_KEYBOARD;
         ip.ki.wVk = VK_BACK;
         inputs.push_back(ip);
-        
         ip.ki.dwFlags = KEYEVENTF_KEYUP;
         inputs.push_back(ip);
     }
-    if (!inputs.empty()) {
-        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-    }
+    if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
-// Injects the replacement string using the Unicode flag
 void SendString(const std::wstring& str) {
     std::vector<INPUT> inputs;
     for (wchar_t c : str) {
@@ -90,102 +84,104 @@ void SendString(const std::wstring& str) {
         ip.ki.wScan = c;
         ip.ki.dwFlags = KEYEVENTF_UNICODE;
         inputs.push_back(ip);
-        
         ip.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         inputs.push_back(ip);
     }
-    if (!inputs.empty()) {
-        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-    }
+    if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
-// Low-level keyboard hook procedure
-LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-        if (g_isProcessing) return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-        
-        KBDLLHOOKSTRUCT* pKeyBoard = (KBDLLHOOKSTRUCT*)lParam;
-        DWORD vkCode = pKeyBoard->vkCode;
-        
-        wchar_t c = 0;
-        
-        // Basic Virtual-Key mapping
-        if (vkCode >= 'A' && vkCode <= 'Z') {
-            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
-            c = (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
-        } 
-        else if (vkCode >= '0' && vkCode <= '9') c = (wchar_t)vkCode;
-        else if (vkCode == VK_SPACE) c = L' ';
-        else if (vkCode == VK_BACK) {
-            if (!g_buffer.empty()) g_buffer.pop_back();
-            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-        } 
-        else {
-            g_buffer.clear(); // Reset buffer on unmapped keys (like Enter, Esc, etc.)
-            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-        }
-        
-        if (c != 0) {
-            g_buffer += c;
-            if (g_buffer.length() > g_maxHotstringLength) {
-                g_buffer.erase(0, g_buffer.length() - g_maxHotstringLength);
-            }
-            
-            // Check for a hotstring match
-            for (const auto& pair : g_expansions) {
-                const std::wstring& trigger = pair.first;
-                if (g_buffer.length() >= trigger.length() && 
-                    g_buffer.compare(g_buffer.length() - trigger.length(), trigger.length(), trigger) == 0) {
-                    
-                    g_isProcessing = true;
-                    g_buffer.clear();
-                    
-                    // Erase typed characters (-1 because we block the final keydown from registering)
-                    SendBackspace((int)trigger.length() - 1);
-                    SendString(pair.second);
-                    
-                    g_isProcessing = false;
-                    return 1; // Block the current keystroke so it doesn't output
-                }
-            }
-        }
-    }
-    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-}
-
-// Background thread loop to keep the hook alive
-DWORD WINAPI HookThread(LPVOID lpParam) {
-    LoadSettings();
-    g_hHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
+bool ProcessKey(DWORD vkCode) {
+    if (t_isProcessing) return false;
     
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    wchar_t c = 0;
+    if (vkCode >= 'A' && vkCode <= 'Z') {
+        bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+        c = (shift ^ caps) ? (wchar_t)vkCode : (wchar_t)(vkCode + 32);
+    } else if (vkCode >= '0' && vkCode <= '9') {
+        c = (wchar_t)vkCode;
+    } else if (vkCode == VK_SPACE) {
+        c = L' ';
+    } else if (vkCode == VK_BACK) {
+        if (!t_buffer.empty()) t_buffer.pop_back();
+        return false;
+    } else if (vkCode != VK_SHIFT && vkCode != VK_CAPITAL) {
+        t_buffer.clear();
+        return false;
     }
     
-    if (g_hHook) {
-        UnhookWindowsHookEx(g_hHook);
-        g_hHook = NULL;
+    if (c != 0) {
+        t_buffer += c;
+        
+        AcquireSRWLockShared(&g_lock);
+        if (t_buffer.length() > g_maxHotstringLength) {
+            t_buffer.erase(0, t_buffer.length() - g_maxHotstringLength);
+        }
+        
+        for (const auto& pair : g_expansions) {
+            const std::wstring& trigger = pair.first;
+            if (t_buffer.length() >= trigger.length() && 
+                t_buffer.compare(t_buffer.length() - trigger.length(), trigger.length(), trigger) == 0) {
+                
+                t_isProcessing = true;
+                t_buffer.clear();
+                
+                SendBackspace((int)trigger.length() - 1);
+                SendString(pair.second);
+                
+                t_isProcessing = false;
+                ReleaseSRWLockShared(&g_lock);
+                return true; // Match found, swallow the final trigger key
+            }
+        }
+        ReleaseSRWLockShared(&g_lock);
     }
-    return 0;
+    return false;
 }
 
-// Triggered automatically by Windhawk when user edits settings
+// Hook GetMessageW
+typedef BOOL (WINAPI *GetMessageW_t)(LPMSG, HWND, UINT, UINT);
+GetMessageW_t GetMessageW_Original;
+
+BOOL WINAPI GetMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
+    BOOL res = GetMessageW_Original(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
+    if (res > 0 && lpMsg) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (ProcessKey((DWORD)lpMsg->wParam)) {
+                lpMsg->message = WM_NULL; // Swallow the triggering keystroke
+            }
+        }
+    }
+    return res;
+}
+
+// Hook PeekMessageW
+typedef BOOL (WINAPI *PeekMessageW_t)(LPMSG, HWND, UINT, UINT, UINT);
+PeekMessageW_t PeekMessageW_Original;
+
+BOOL WINAPI PeekMessageW_Hook(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+    BOOL res = PeekMessageW_Original(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    if (res && lpMsg && (wRemoveMsg & PM_REMOVE)) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (ProcessKey((DWORD)lpMsg->wParam)) {
+                lpMsg->message = WM_NULL; // Swallow the triggering keystroke
+            }
+        }
+    }
+    return res;
+}
+
 void Wh_ModSettingsChanged() {
     LoadSettings();
 }
 
 BOOL Wh_ModInit() {
-    g_hThread = CreateThread(NULL, 0, HookThread, NULL, 0, &g_threadId);
+    LoadSettings();
+    Wh_SetFunctionHook((void*)GetMessageW, (void*)GetMessageW_Hook, (void**)&GetMessageW_Original);
+    Wh_SetFunctionHook((void*)PeekMessageW, (void*)PeekMessageW_Hook, (void**)&PeekMessageW_Original);
     return TRUE;
 }
 
 void Wh_ModUninit() {
-    if (g_threadId) {
-        PostThreadMessage(g_threadId, WM_QUIT, 0, 0);
-        WaitForSingleObject(g_hThread, 1000);
-        CloseHandle(g_hThread);
-    }
+    // Windhawk automatically handles API unhooking on unload
 }
